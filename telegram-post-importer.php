@@ -42,6 +42,7 @@ function tpi_sanitize_settings($settings) {
     $out['author_id'] = isset($settings['author_id']) ? absint($settings['author_id']) : get_current_user_id();
     $out['max_per_run'] = isset($settings['max_per_run']) ? absint($settings['max_per_run']) : 50;
     $out['category_id'] = isset($settings['category_id']) ? absint($settings['category_id']) : 0;
+    $out['overwrite_existing'] = !empty($settings['overwrite_existing']) ? 1 : 0;
 
     return $out;
 }
@@ -53,6 +54,7 @@ function tpi_get_settings() {
         'author_id' => get_current_user_id(),
         'max_per_run' => 50,
         'category_id' => 0,
+        'overwrite_existing' => 0,
     ];
 
     $settings = get_option(TPI_OPTION, []);
@@ -133,6 +135,15 @@ function tpi_render_settings_page() {
                     <td>
                         <input name="<?php echo esc_attr(TPI_OPTION); ?>[max_per_run]" id="tpi_max_per_run" type="number" min="0" value="<?php echo esc_attr($settings['max_per_run']); ?>" class="small-text" />
                         <p class="description">0 means import all (can time out on large channels).</p>
+                    </td>
+                </tr>
+                <tr>
+                    <th scope="row">Overwrite Existing</th>
+                    <td>
+                        <label for="tpi_overwrite_existing">
+                            <input name="<?php echo esc_attr(TPI_OPTION); ?>[overwrite_existing]" id="tpi_overwrite_existing" type="checkbox" value="1" <?php checked(!empty($settings['overwrite_existing'])); ?> />
+                            Update existing posts when the message was already imported.
+                        </label>
                     </td>
                 </tr>
             </table>
@@ -225,20 +236,29 @@ function tpi_handle_import_selected() {
     }
 
     $imported = 0;
+    $updated = 0;
     $skipped = 0;
 
     foreach ($selected as $message) {
-        if (tpi_message_exists($settings['channel'], $message['id'])) {
+        $existing_id = tpi_find_existing_post_id($settings['channel'], $message['id']);
+        if ($existing_id && empty($settings['overwrite_existing'])) {
             $skipped++;
             continue;
         }
 
-        $post_id = tpi_create_post_from_message($message, $settings);
+        $post_id = tpi_create_post_from_message($message, $settings, $existing_id);
         if ($post_id) {
-            $imported++;
+            if ($existing_id) {
+                $updated++;
+            } else {
+                $imported++;
+            }
         }
     }
 
+    if (!empty($settings['overwrite_existing'])) {
+        tpi_set_result_and_redirect(sprintf('Imported %d posts, updated %d existing posts, skipped %d posts.', $imported, $updated, $skipped));
+    }
     tpi_set_result_and_redirect(sprintf('Imported %d posts, skipped %d existing posts.', $imported, $skipped));
 }
 
@@ -268,20 +288,29 @@ function tpi_handle_import() {
     }
 
     $imported = 0;
+    $updated = 0;
     $skipped = 0;
 
     foreach ($messages as $message) {
-        if (tpi_message_exists($channel, $message['id'])) {
+        $existing_id = tpi_find_existing_post_id($channel, $message['id']);
+        if ($existing_id && empty($settings['overwrite_existing'])) {
             $skipped++;
             continue;
         }
 
-        $post_id = tpi_create_post_from_message($message, $settings);
+        $post_id = tpi_create_post_from_message($message, $settings, $existing_id);
         if ($post_id) {
-            $imported++;
+            if ($existing_id) {
+                $updated++;
+            } else {
+                $imported++;
+            }
         }
     }
 
+    if (!empty($settings['overwrite_existing'])) {
+        tpi_set_result_and_redirect(sprintf('Imported %d posts, updated %d existing posts, skipped %d posts.', $imported, $updated, $skipped));
+    }
     tpi_set_result_and_redirect(sprintf('Imported %d posts, skipped %d existing posts.', $imported, $skipped));
 }
 
@@ -332,7 +361,7 @@ function tpi_render_preview_table($settings) {
     $sort_url = admin_url('options-general.php?page=telegram-post-importer');
     ?>
     <h2>Select Messages to Import</h2>
-    <p>Preview expires in 10 minutes. Existing posts are unchecked.</p>
+    <p>Preview expires in 10 minutes. Existing posts are unchecked unless overwrite is enabled.</p>
     <form method="get" action="<?php echo esc_url($sort_url); ?>">
         <input type="hidden" name="page" value="telegram-post-importer" />
         <label for="tpi_sort_order">Sort by date:</label>
@@ -378,7 +407,7 @@ function tpi_render_preview_table($settings) {
                     ?>
                     <tr>
                         <td>
-                            <input type="checkbox" name="tpi_message_ids[]" value="<?php echo esc_attr($message_id); ?>" <?php checked(!$is_existing); ?> />
+                            <input type="checkbox" name="tpi_message_ids[]" value="<?php echo esc_attr($message_id); ?>" <?php checked(!$is_existing || !empty($settings['overwrite_existing'])); ?> />
                         </td>
                         <td><?php echo esc_html(tpi_format_datetime($message['datetime'])); ?></td>
                         <td>
@@ -596,6 +625,7 @@ function tpi_parse_messages_html($html, $channel) {
 
         $text_node = $xpath->query(".//div[contains(concat(' ', normalize-space(@class), ' '), ' tgme_widget_message_text ')]", $wrap)->item(0);
         $text_html = $text_node ? tpi_inner_html($text_node) : '';
+        $text_html = tpi_strip_emoji_backgrounds($text_html);
         $title_text = tpi_extract_title_from_text($text_html);
 
         $media_html = tpi_extract_media_html($wrap, $xpath);
@@ -639,6 +669,7 @@ function tpi_parse_messages_html_regex($html, $channel) {
         if (preg_match('/<div class="tgme_widget_message_text[^"]*">(.*?)<\\/div>/is', $chunk, $text_match)) {
             $text_html = $text_match[1];
         }
+        $text_html = tpi_strip_emoji_backgrounds($text_html);
 
         $media_html = tpi_extract_media_html_regex($chunk);
 
@@ -788,7 +819,32 @@ function tpi_message_exists($channel, $message_id) {
     return !empty($posts);
 }
 
-function tpi_create_post_from_message($message, $settings) {
+function tpi_find_existing_post_id($channel, $message_id) {
+    $posts = get_posts([
+        'post_type' => 'post',
+        'post_status' => 'any',
+        'meta_query' => [
+            [
+                'key' => '_tpi_channel',
+                'value' => $channel,
+            ],
+            [
+                'key' => '_tpi_message_id',
+                'value' => $message_id,
+            ],
+        ],
+        'fields' => 'ids',
+        'posts_per_page' => 1,
+    ]);
+
+    if (empty($posts)) {
+        return 0;
+    }
+
+    return (int) $posts[0];
+}
+
+function tpi_create_post_from_message($message, $settings, $existing_id = 0) {
     $content_parts = [];
     if (!empty($message['text_html'])) {
         $text_html = $message['text_html'];
@@ -817,6 +873,10 @@ function tpi_create_post_from_message($message, $settings) {
         'post_type' => 'post',
     ];
 
+    if ($existing_id) {
+        $post_data['ID'] = (int) $existing_id;
+    }
+
     if (!empty($settings['category_id'])) {
         $post_data['post_category'] = [(int) $settings['category_id']];
     }
@@ -829,7 +889,7 @@ function tpi_create_post_from_message($message, $settings) {
         }
     }
 
-    $post_id = wp_insert_post($post_data, true);
+    $post_id = $existing_id ? wp_update_post($post_data, true) : wp_insert_post($post_data, true);
     if (is_wp_error($post_id)) {
         return 0;
     }
@@ -933,6 +993,38 @@ function tpi_extract_title_from_text($text_html) {
 
     $candidate = trim(strtok(wp_strip_all_tags($text_html), "\n"));
     return $candidate;
+}
+
+function tpi_strip_emoji_backgrounds($text_html) {
+    $text_html = (string) $text_html;
+    if ($text_html === '') {
+        return $text_html;
+    }
+
+    if (class_exists('DOMDocument')) {
+        $text_html = tpi_force_utf8($text_html);
+        $dom = new DOMDocument();
+        libxml_use_internal_errors(true);
+        tpi_dom_load_html($dom, '<div>' . $text_html . '</div>');
+        libxml_clear_errors();
+        $xpath = new DOMXPath($dom);
+        $nodes = $xpath->query('//i[contains(concat(" ", normalize-space(@class), " "), " emoji ")]');
+        if ($nodes && $nodes->length > 0) {
+            foreach ($nodes as $node) {
+                $style = $node->getAttribute('style');
+                if ($style && stripos($style, 'telegram.org/img/emoji') !== false) {
+                    $node->removeAttribute('style');
+                }
+            }
+        }
+        $wrapper = $dom->getElementsByTagName('div')->item(0);
+        if ($wrapper) {
+            return tpi_inner_html($wrapper);
+        }
+    }
+
+    $pattern = '/(<i\\b[^>]*class="[^"]*\\bemoji\\b[^"]*"[^>]*?)\\sstyle=(["\'])[^\\"\']*telegram\\.org\\/img\\/emoji[^\\"\']*\\2([^>]*>)/i';
+    return preg_replace($pattern, '$1$3', $text_html);
 }
 
 function tpi_safe_substr($value, $start, $length) {
